@@ -1,7 +1,7 @@
 # ⚡ ESP12F Energy Meter – OTA + MQTT + Reset
 
 **Version:** V4  
-**Author:** Amir684684
+**Author:** Amirtronics
 **Year:** 2025  
 
 ---

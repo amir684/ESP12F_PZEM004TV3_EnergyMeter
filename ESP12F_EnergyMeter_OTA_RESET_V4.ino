@@ -92,7 +92,7 @@
 
 // ---------------- הגדרות OTA ----------------
 #define OTA_HOSTNAME    "EnergyMeter"
-#define OTA_PASSWORD    "amir3080"
+#define OTA_PASSWORD    "12345678"
 
 // ---------------- הגדרות MQTT ----------------
 #define MQTT_SERVER     "192.168.1.175"

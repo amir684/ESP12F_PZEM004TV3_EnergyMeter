@@ -2,7 +2,7 @@
   ---------------------------------------------------------------
   Project: ESP12F Energy Meter with OTA + MQTT + Reset
   Version: V4
-  Author: Amir684684
+  Author: Amirtronics
   Date: 2025
   ---------------------------------------------------------------
 
@@ -98,7 +98,7 @@
 #define MQTT_SERVER     "192.168.1.175"
 #define MQTT_PORT       1883
 #define MQTT_USER       "mqtt_user"
-#define MQTT_PASS       "amir3080"
+#define MQTT_PASS       "password"
 #define MQTT_TOPIC      "home/energy"
 #define MQTT_RESET_TOPIC "home/energy/reset"
 
@@ -127,7 +127,7 @@ void splashScreen() {
   u8g2.print("Meter");
   u8g2.setFont(u8g2_font_6x12_tr);
   u8g2.setCursor(2, 70);
-  u8g2.print("Amir Yahud");
+  u8g2.print("Amirtronics");
   u8g2.setFont(u8g2_font_5x8_tr);
   u8g2.setCursor(25, 90);
   u8g2.print("2025");

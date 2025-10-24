@@ -55,7 +55,7 @@ and publishes live readings via **MQTT** for integration with Home Assistant, No
 | Parameter | Value |
 |------------|--------|
 | Hostname | `EnergyMeter` |
-| Password | `amir3080` |
+| Password | `12345678` |
 
 To upload new firmware:
 1. Connect your PC to the same Wi-Fi network as the device.  

@@ -2,7 +2,7 @@
   ---------------------------------------------------------------
   Project: ESP12F Energy Meter with OTA + MQTT + Reset
   Version: V4
-  Author: Amirtronics
+  Author: AmirY
   Date: 2025
   ---------------------------------------------------------------
 
@@ -127,7 +127,7 @@ void splashScreen() {
   u8g2.print("Meter");
   u8g2.setFont(u8g2_font_6x12_tr);
   u8g2.setCursor(2, 70);
-  u8g2.print("Amirtronics");
+  u8g2.print("AmirY");
   u8g2.setFont(u8g2_font_5x8_tr);
   u8g2.setCursor(25, 90);
   u8g2.print("2025");

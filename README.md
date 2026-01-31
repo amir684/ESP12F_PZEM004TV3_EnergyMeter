@@ -1,7 +1,7 @@
 # ⚡ ESP12F Energy Meter – OTA + MQTT + Reset
 
 **Version:** V4  
-**Author:** Amirtronics
+**Author:** Amir
 **Year:** 2025  
 
 ---
@@ -81,5 +81,5 @@ Install these via **Arduino Library Manager**:
 - Default MQTT broker: `192.168.1.175:1883`
 - Default credentials:
   - Username: `mqtt_user`
-  - Password: `amir3080`
+  - Password: `12345678`
 - The device automatically opens a configuration portal named:

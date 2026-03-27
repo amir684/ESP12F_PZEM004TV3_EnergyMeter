@@ -426,9 +426,9 @@ void loop() {
     for (int i = 0; i < 4; i++) {
       int h = (i + 1) * 2;
       if (i < bars) {
-        u8g2.drawBox(startX + i * 3, startY + (maxHeight - h), 2, h);
+        u8g2.drawBox(startX + i * 5, startY + (maxHeight - h), 4, h);
       } else {
-        u8g2.drawFrame(startX + i * 3, startY + (maxHeight - h), 2, h);
+        u8g2.drawFrame(startX + i * 5, startY + (maxHeight - h), 4, h);
       }
     }
     

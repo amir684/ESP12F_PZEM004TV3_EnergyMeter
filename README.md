@@ -16,12 +16,16 @@ This smart energy meter combines an ESP8266 (ESP-12F) microcontroller with a PZE
 
 ### Key Features
 - ⚡ **Real-time AC Monitoring**: Voltage, Current, Power, Energy, Frequency, Power Factor
-- 📊 **ST7567 LCD Display**: 128x64 graphical display with WiFi signal indicator
-- 🏠 **Home Assistant Integration**: Full MQTT auto-discovery support
+- 🌐 **Web Management UI**: Built-in web server with tabbed interface — live Status, Sessions history, and editable WiFi / MQTT settings
+- 👆 **Touch Screen Navigation**: TTP223 capacitive touch cycles 4 LCD screens (Readings → Power Graph → Status → Info)
+- 🧺 **Washing-Session Logging**: Automatically detects appliance cycles by power draw and logs start/end/duration/energy/peak to flash
+- 🏠 **Home Assistant Auto-Discovery**: Zero-config device creation, including a "Washing" running sensor and availability (LWT)
+- 📊 **ST7567 LCD Display**: 128x64 graphical display with WiFi signal indicator and on-device power graph
+- 💾 **Persistent Config**: Hostname and MQTT settings stored in LittleFS, editable from the web (no reflash)
+- 🕒 **NTP Real-Time Clock**: Accurate timestamps for logged sessions (auto DST)
 - 📡 **OTA Firmware Updates**: Update firmware wirelessly over WiFi
-- 🔄 **Remote Energy Reset**: Reset energy counter via MQTT command
-- 📶 **WiFiManager**: Easy WiFi configuration via captive portal
-- 🎛️ **PWM Backlight Control**: Adjustable LCD brightness
+- 🔄 **Remote Energy Reset**: Reset energy counter via MQTT command or the web UI
+- 📶 **WiFiManager**: Easy first-time WiFi configuration via captive portal
 - 🔐 **Password Protected OTA**: Secure firmware updates
 
 ## 🎯 Use Cases
@@ -79,6 +83,19 @@ D6 (GPIO12) →  LED (Backlight PWM)
 GND         →  GND
 ```
 
+#### ESP12F ↔️ TTP223 Touch Sensor
+```
+ESP12F         TTP223
+─────────────────────────────
+RX (GPIO3)  →  OUT (idle LOW, touch HIGH)
+3.3V        →  VCC
+GND         →  GND
+```
+> ⚠️ GPIO3 is the UART RX pin. Using it for touch disables serial *input*
+> (debug prints via TX still work). **Disconnect the sensor before flashing
+> over USB** — OTA updates are unaffected. Each touch advances the LCD to the
+> next screen.
+
 ![PZEM Readings](images/pzem-readings.jpg)
 
 ## 📦 Installation
@@ -104,23 +121,40 @@ pio lib install "ArduinoOTA"
 
 ### 3. Configuration
 
-Edit the configuration in the sketch:
+The `#define` values in the sketch are only **initial defaults** used on the very
+first boot. Afterwards, the hostname and all MQTT settings are editable from the
+**web UI** and stored in LittleFS — no reflash needed to change them.
 
 ```cpp
-// MQTT Settings
+// Network identity (shown in your router; editable via web)
+#define DEFAULT_HOSTNAME "EnergyMeter"
+
+// MQTT defaults (first boot only)
 #define MQTT_SERVER     "192.168.1.175"  // Your MQTT broker IP
 #define MQTT_PORT       1883
 #define MQTT_USER       "mqtt_user"      // Your MQTT username
 #define MQTT_PASS       "password"       // Your MQTT password
+#define MQTT_TOPIC      "home/energy"    // Base topic
 
-// OTA Settings
-#define OTA_HOSTNAME    "EnergyMeter"
+// OTA
 #define OTA_PASSWORD    "12345678"       // Change this!
+
+// Washing-session detection
+#define SESSION_POWER_THRESHOLD 10.0f    // W: above = running
+#define SESSION_END_GRACE       300000UL // ms below threshold to end a session (5 min)
+#define SESSION_MIN_DURATION    60UL     // s: ignore shorter blips
+
+// NTP (real-time clock for timestamps)
+#define NTP_TZ  "IST-2IDT,M3.4.4/26,M10.5.0"  // Israel (change for your timezone)
 
 // LCD Settings
 #define LCD_BRIGHTNESS  500              // 0-1023
 #define LCD_CONTRAST    20               // 0-63
 ```
+
+> The build uses a 4MB flash layout with a 2MB LittleFS partition
+> (`board_build.ldscript = eagle.flash.4m2m.ld` in `platformio.ini`) to store
+> configuration and session logs.
 
 ### 4. Compile and Upload
 ```bash
@@ -141,13 +175,67 @@ pio device monitor
 3. Enter your WiFi credentials in the captive portal
 4. Device will connect and display its IP address on the LCD
 
+## 🌐 Web Management UI
+
+Open `http://<device-ip>/` (or `http://<hostname>.local/`) in any browser.
+The device appears in your router's device list under its configurable hostname.
+
+The interface has four tabs:
+
+| Tab | Purpose |
+|-----|---------|
+| **Status** | Live readings (V/I/P/E/Hz/PF), WiFi/MQTT/uptime/heap, current wash-session state, and a **Reset Energy Counter** button |
+| **Sessions** | Full washing-session history table (date, duration, kWh, peak) with total energy and a **Clear History** button |
+| **WiFi** | Connection info + edit the **device name** (router hostname) and switch WiFi network |
+| **MQTT** | Edit broker address, port, username, password and base topic — saved to flash and reconnected instantly |
+
+Status data refreshes every 2 seconds via a lightweight JSON API (`/api/status`).
+
+## 🧺 Washing-Session Logging
+
+Purpose-built to log washing-machine (or any appliance) cycles automatically,
+with no smart plug required — it uses the measured power draw:
+
+- **Session start**: power rises above `SESSION_POWER_THRESHOLD` (default **10 W**)
+- **Session end**: power stays below the threshold continuously for
+  `SESSION_END_GRACE` (default **5 min**). The recorded end time is the moment
+  power actually dropped — so soak/pause phases mid-cycle don't split a session
+  or inflate its duration.
+- Sessions shorter than `SESSION_MIN_DURATION` (60 s) are ignored as noise.
+
+Each session records **start, end, duration, energy consumed (kWh), and peak
+power**. The last 40 sessions are kept in flash (LittleFS) and survive reboots.
+View them in the web **Sessions** tab, and use the Home Assistant
+`Washing` sensor to trigger automations like "notify me when the wash is done".
+
 ## 🏠 Home Assistant Integration
 
 ![Home Assistant Dashboard](images/home-assistant-dashboard.jpg)
 
+### Automatic Discovery (recommended)
+
+The device publishes **MQTT auto-discovery** messages under the `homeassistant/`
+prefix on every broker connection. As long as the Home Assistant **MQTT
+integration** is installed (discovery is on by default), a single device named
+after your hostname appears automatically under **Settings → Devices → MQTT**,
+with all entities below — **no YAML editing required**.
+
+Auto-created entities:
+
+| Entity | Type | Notes |
+|--------|------|-------|
+| Voltage / Current / Power / Frequency | sensor | `measurement` |
+| Energy | sensor | `total_increasing` (works with the Energy Dashboard) |
+| Power Factor | sensor | `power_factor` |
+| **Washing** | binary_sensor | `running` — ON while an appliance cycle is active |
+| **Session Energy** | sensor | energy of the current / last session (kWh) |
+
+A **Last Will (LWT)** on `home/energy/status` marks all entities *unavailable* if
+the device goes offline.
+
 ### MQTT Topics
 
-The device publishes to the following topics:
+The device publishes to the following topics (base topic `home/energy` is configurable):
 
 | Topic | Description | Unit | Update Rate |
 |-------|-------------|------|-------------|
@@ -157,6 +245,9 @@ The device publishes to the following topics:
 | `home/energy/energy` | Cumulative energy | kWh | 5 seconds |
 | `home/energy/frequency` | AC Frequency | Hz | 5 seconds |
 | `home/energy/pf` | Power factor | - | 5 seconds |
+| `home/energy/session` | Washing running (`ON`/`OFF`) | - | 5 seconds |
+| `home/energy/session_energy` | Current/last session energy | kWh | 5 seconds |
+| `home/energy/status` | Availability (`online`/`offline`, LWT) | - | On connect |
 | `home/energy/reset_status` | Reset command status | - | On demand |
 
 ### Remote Energy Reset
@@ -169,7 +260,10 @@ mosquitto_pub -h localhost -t "home/energy/reset" -m "RESET"
 
 The device will respond with "SUCCESS" or "FAILED" on `home/energy/reset_status`.
 
-### Home Assistant YAML Configuration
+### Manual YAML Configuration (optional)
+
+Only needed if you have MQTT discovery disabled — otherwise the entities above
+are created automatically.
 
 ```yaml
 mqtt:
@@ -215,23 +309,21 @@ mqtt:
 
 ## 🎨 LCD Display
 
-The ST7567 LCD shows:
-- **Voltage** (V)
-- **Current** (A)
-- **Power** (W)
-- **Energy** (kWh)
-- **Frequency** (Hz)
-- **Power Factor**
-- **WiFi Signal Strength** (visual indicator)
-- **MQTT Connection Status** ("MQ" indicator)
+Touch the TTP223 sensor to cycle through four screens:
+
+1. **Main Readings** — Voltage, Current, Power, Energy, Frequency, Power Factor,
+   with a WiFi signal indicator and an **"MQTT"** connection label
+2. **Power Graph** — live scrolling history of power draw
+3. **Status** — WiFi SSID/IP/RSSI, MQTT state, uptime
+4. **Info** — total kWh, peak power, session count, wash state, free heap
 
 ## 🔧 OTA Updates
 
 ### Update Firmware Over WiFi
 
-1. Find device IP address (shown on LCD or serial monitor)
+1. Find device IP address (shown on LCD or in the router / web UI)
 2. Open Arduino IDE → Tools → Port → Network Port
-3. Select "EnergyMeter at [IP_ADDRESS]"
+3. Select your device by its hostname (default "EnergyMeter") at `[IP_ADDRESS]`
 4. Enter password: `12345678`
 5. Upload new firmware
 
@@ -258,7 +350,8 @@ pio run --target upload --upload-port [IP_ADDRESS]
 ### Update Intervals
 - **LCD Refresh**: 2 seconds
 - **MQTT Publish**: 5 seconds
-- **Serial Output**: 2 seconds
+- **Web Status API**: 2 seconds
+- **Session Detection**: evaluated every reading (non-blocking loop)
 
 ## 🔧 Troubleshooting
 
@@ -295,10 +388,12 @@ pio run --target upload --upload-port [IP_ADDRESS]
 
 ## 📈 Future Enhancements
 
-- [ ] MQTT Auto-Discovery for Home Assistant
-- [ ] Web interface for configuration
-- [ ] Data logging to SD card
+- [x] MQTT Auto-Discovery for Home Assistant
+- [x] Web interface for configuration
+- [x] Session logging to flash (LittleFS)
+- [x] Touch-screen navigation with on-device graph
 - [ ] Cost calculation based on electricity rate
+- [ ] CSV export of session history
 - [ ] Daily/monthly energy statistics
 - [ ] Power limit alerts
 - [ ] Multi-channel support (multiple PZEM sensors)

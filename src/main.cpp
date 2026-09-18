@@ -68,9 +68,23 @@
 #define LCD_BRIGHTNESS  500
 #define LCD_CONTRAST    20
 #define LCD_ROTATION    U8G2_R3
+
+// Backlight auto-dim (PWM range is 0..1023)
+#define LCD_DIM_LEVEL    45      // idle brightness
+#define LCD_DIM_TIMEOUT  60000UL // ms without a touch before dimming
+#define LCD_FADE_STEP    20      // PWM steps per fade tick
+#define LCD_FADE_MS      12      // ms between fade ticks
+
+// Canvas is 64 x 128: a 128x64 panel rotated by U8G2_R3
+#define SCR_W           64
+#define SCR_H          128
+#define HEADER_H        11
+#define DOTS_Y         124
+
+#define FONT_MICRO      u8g2_font_4x6_tr
+#define FONT_SMALL      u8g2_font_5x8_tr
 #define FONT_LABEL      u8g2_font_6x12_tr
 #define FONT_VALUE      u8g2_font_7x13B_tr
-#define LINE_GAP        21
 
 // Non-blocking timing intervals (ms)
 #define READ_INTERVAL          2000    // PZEM read + display refresh
@@ -78,8 +92,9 @@
 #define MQTT_RECONNECT_INTERVAL 5000   // spacing between reconnect attempts
 
 // ---------------- Touch (TTP223) ----------------
-#define TOUCH_PIN       3       // GPIO3 / RX / D9, idle LOW (UART RX repurposed)
-#define TOUCH_DEBOUNCE  200     // ms
+#define TOUCH_PIN        3      // GPIO3 / RX / D9, idle LOW (UART RX repurposed)
+#define TOUCH_DEBOUNCE   200    // ms
+#define TOUCH_LONG_PRESS 800    // ms held = jump back to the main screen
 
 // ---------------- Network identity ----------------
 #define DEFAULT_HOSTNAME "EnergyMeter"   // shown in the router; editable via web
@@ -148,6 +163,15 @@ uint8_t currentScreen = SCR_MAIN;
 // Touch state
 int           lastTouchState = LOW;
 unsigned long lastTouchTime = 0;
+unsigned long touchDownTime = 0;
+bool          longPressFired = false;
+bool          touchWokeDisplay = false;   // this press only un-dimmed the LCD
+
+// Backlight state
+int           blCurrent = LCD_BRIGHTNESS;
+int           blTarget  = LCD_BRIGHTNESS;
+unsigned long blLastActivity = 0;
+unsigned long blLastFade = 0;
 
 // Power history for the graph
 #define GRAPH_POINTS 64
@@ -327,133 +351,360 @@ void updateSession(float p, float e) {
 
 // ============================================================
 //  Display helpers
+//
+//  Canvas is 64 x 128 (a 128x64 panel rotated by U8G2_R3), so every
+//  layout below is portrait. All drawing goes through the o*()
+//  wrappers, which add a horizontal offset -- that is what lets a
+//  whole screen be slid sideways for the touch transition without
+//  the layout code knowing anything about it.
 // ============================================================
-void splashScreen() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_9x15B_tr);
-  u8g2.setCursor(4, 15);
-  u8g2.print("Energy");
-  u8g2.setCursor(8, 35);
-  u8g2.print("Meter");
-  u8g2.setFont(u8g2_font_6x12_tr);
-  u8g2.setCursor(2, 70);
-  u8g2.print("AmirY");
-  u8g2.setFont(u8g2_font_5x8_tr);
-  u8g2.setCursor(25, 90);
-  u8g2.print("V5");
-  u8g2.sendBuffer();
-  delay(3000);
+
+// Horizontal draw offset, non-zero only while a slide is running
+static int16_t gOX = 0;
+// Screen currently being drawn (differs from currentScreen mid-slide)
+static uint8_t gDrawScreen = SCR_MAIN;
+// Axis top of the last graph drawn, so the caller can label it
+static float   gGraphMax = 1;
+
+static inline void oPixel(int x, int y)                  { u8g2.drawPixel(x + gOX, y); }
+static inline void oHLine(int x, int y, int w)           { u8g2.drawHLine(x + gOX, y, w); }
+static inline void oVLine(int x, int y, int h)           { u8g2.drawVLine(x + gOX, y, h); }
+static inline void oBox(int x, int y, int w, int h)      { u8g2.drawBox(x + gOX, y, w, h); }
+static inline void oFrame(int x, int y, int w, int h)    { u8g2.drawFrame(x + gOX, y, w, h); }
+static inline void oRBox(int x, int y, int w, int h, int r)   { u8g2.drawRBox(x + gOX, y, w, h, r); }
+static inline void oRFrame(int x, int y, int w, int h, int r) { u8g2.drawRFrame(x + gOX, y, w, h, r); }
+static inline void oLine(int x0, int y0, int x1, int y1) { u8g2.drawLine(x0 + gOX, y0, x1 + gOX, y1); }
+static inline void oDisc(int x, int y, int r)            { u8g2.drawDisc(x + gOX, y, r); }
+static inline void oTri(int x0, int y0, int x1, int y1, int x2, int y2) {
+  u8g2.drawTriangle(x0 + gOX, y0, x1 + gOX, y1, x2 + gOX, y2);
+}
+static inline void oStr(int x, int y, const char* s)     { u8g2.drawStr(x + gOX, y, s); }
+// Right-aligned: xr is the last pixel column the text may occupy
+static inline void oStrR(int xr, int y, const char* s)   { oStr(xr - u8g2.getStrWidth(s) + 1, y, s); }
+static inline void oStrC(int xc, int y, const char* s)   { oStr(xc - u8g2.getStrWidth(s) / 2, y, s); }
+
+// Small rotating scratch buffers, so several formatted values can be
+// used in one expression without each caller declaring its own array.
+static char    fmtBuf[4][20];
+static uint8_t fmtIdx = 0;
+static const char* fmtF(float v, int dec) {
+  fmtIdx = (fmtIdx + 1) & 3;
+  if (isnan(v) || isinf(v)) v = 0;
+  snprintf(fmtBuf[fmtIdx], sizeof(fmtBuf[0]), "%.*f", dec, v);
+  return fmtBuf[fmtIdx];
+}
+// Compact form for large numbers: 940 -> "940", 2150 -> "2.1k"
+static const char* fmtK(float v) {
+  fmtIdx = (fmtIdx + 1) & 3;
+  if (isnan(v) || isinf(v) || v < 0) v = 0;
+  if (v >= 1000.0f) snprintf(fmtBuf[fmtIdx], sizeof(fmtBuf[0]), "%.1fk", v / 1000.0f);
+  else              snprintf(fmtBuf[fmtIdx], sizeof(fmtBuf[0]), "%.0f",  v);
+  return fmtBuf[fmtIdx];
 }
 
-void showWiFiStatus(const char* msg) {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x12_tr);
-  u8g2.setCursor(0, 15);
-  u8g2.print("WiFi Status:");
-  u8g2.setCursor(0, 35);
-  u8g2.print(msg);
-  u8g2.sendBuffer();
+// ---- primitives -------------------------------------------------
+// 50% checkerboard fill of one column, used for the graph area fill.
+// The (x ^ y) parity keeps the dither aligned between columns.
+static void ditherCol(int x, int yTop, int yBottom) {
+  int y = yTop + (((yTop ^ x) & 1) ? 1 : 0);
+  for (; y <= yBottom; y += 2) oPixel(x, y);
 }
 
-void showOTAStatus(const char* msg, int progress = -1) {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x12_tr);
-  u8g2.setCursor(0, 15);
-  u8g2.print("OTA Update");
-  u8g2.setCursor(0, 35);
-  u8g2.print(msg);
-  if (progress >= 0) {
-    u8g2.drawFrame(0, 50, 60, 10);
-    u8g2.drawBox(2, 52, (progress * 56) / 100, 6);
-    u8g2.setCursor(20, 75);
-    u8g2.print(progress);
-    u8g2.print("%");
+static void dashedHLine(int x0, int x1, int y) {
+  for (int x = x0; x <= x1; x += 3) oPixel(x, y);
+}
+
+// Rounds up to the next "nice" axis value: 1, 2 or 5 times a power of ten
+static float niceCeil(float v) {
+  if (v <= 0) return 1;
+  float e = powf(10, floorf(log10f(v)));
+  float m = v / e;
+  float n = (m <= 1.0f) ? 1.0f : (m <= 2.0f) ? 2.0f : (m <= 5.0f) ? 5.0f : 10.0f;
+  return n * e;
+}
+
+// ---- shared chrome ----------------------------------------------
+// WiFi bars + MQTT square. Drawn inside the inverted header, so the
+// caller owns the draw colour.
+static void drawHeaderIcons() {
+  bool wl = (WiFi.status() == WL_CONNECTED);
+  int  bars = 0;
+  if (wl) {
+    int rssi = WiFi.RSSI();
+    if      (rssi >= -55) bars = 4;
+    else if (rssi >= -65) bars = 3;
+    else if (rssi >= -75) bars = 2;
+    else                  bars = 1;
   }
-  u8g2.sendBuffer();
-}
 
-// Small WiFi signal bars, top-right of the main screen
-void drawWiFiIcon() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  int rssi = WiFi.RSSI();
-  int bars = 0;
-  if      (rssi >= -55) bars = 4;
-  else if (rssi >= -65) bars = 3;
-  else if (rssi >= -75) bars = 2;
-  else if (rssi >= -85) bars = 1;
-
-  const int nBars = 4, barW = 3, barPitch = 4;   // 4 bars span 16px
-  const int rightX = u8g2.getDisplayWidth() - 1; // real right edge (fits any rotation)
-  const int startX = rightX - (nBars * barPitch - 1);
-  const int startY = 2, maxHeight = 8;
-
+  const int nBars = 4, barW = 2, pitch = 3;
+  const int startX = SCR_W - 2 - (nBars * pitch - 1);   // 4 bars span 11px
   for (int b = 0; b < nBars; b++) {
-    int h = (b + 1) * 2;
-    int x = startX + b * barPitch;
-    if (b < bars) u8g2.drawBox(x, startY + (maxHeight - h), barW, h);
-    else          u8g2.drawFrame(x, startY + (maxHeight - h), barW, h);
+    int h = 2 + b * 2;                                  // 2, 4, 6, 8
+    int x = startX + b * pitch;
+    if (b < bars) oBox(x, 9 - h, barW, h);
+    else          oBox(x, 8, barW, 1);                  // empty bar = foot only
   }
-  if (mqtt.connected()) {
-    u8g2.setFont(u8g2_font_4x6_tr);
-    int w = u8g2.getStrWidth("MQTT");            // right-aligned under the bars
-    u8g2.setCursor(rightX - w + 1, startY + maxHeight + 7);
-    u8g2.print("MQTT");
+
+  if (mqtt.connected()) oBox(startX - 7, 4, 4, 4);
+  else                  oFrame(startX - 7, 4, 4, 4);
+}
+
+static void drawHeader(const char* title) {
+  oBox(0, 0, SCR_W, HEADER_H);
+  u8g2.setDrawColor(0);
+  u8g2.setFont(FONT_SMALL);
+  oStr(3, 8, title);
+  drawHeaderIcons();
+  u8g2.setDrawColor(1);
+}
+
+// Page indicator: one dot per screen, filled for the current one
+static void drawPageDots() {
+  const int pitch = 10;
+  int x0 = (SCR_W - (SCREEN_COUNT - 1) * pitch) / 2;
+  for (int i = 0; i < SCREEN_COUNT; i++) {
+    int cx = x0 + i * pitch;
+    if (i == gDrawScreen) oDisc(cx, DOTS_Y, 2);
+    else                  oBox(cx - 1, DOTS_Y - 1, 2, 2);
   }
 }
 
-void drawParameter(int &y, const char* label, float value, const char* unit, int decimals = 1) {
-  u8g2.setFont(FONT_LABEL);
-  u8g2.setCursor(0, y + 2);
-  u8g2.print(label);
-  u8g2.setFont(FONT_VALUE);
-  u8g2.setCursor(0, y + 14);
-  u8g2.print(isnan(value) ? 0 : value, decimals);
-  u8g2.print(" ");
-  u8g2.print(unit);
-  y += LINE_GAP;
+// Label on the left, value right-aligned on the same baseline. The value
+// drops to the micro font, and is truncated as a last resort, so that it
+// can never run into the label on this 64px-wide canvas.
+static void drawKV(int y, const char* key, const char* val) {
+  u8g2.setFont(FONT_MICRO);
+  oStr(2, y, key);
+  int avail = (SCR_W - 3) - (2 + u8g2.getStrWidth(key) + 3);
+
+  u8g2.setFont(FONT_SMALL);
+  if ((int)u8g2.getStrWidth(val) > avail) u8g2.setFont(FONT_MICRO);
+
+  if ((int)u8g2.getStrWidth(val) <= avail) { oStrR(SCR_W - 3, y, val); return; }
+
+  char cut[24];
+  strncpy(cut, val, sizeof(cut) - 1);
+  cut[sizeof(cut) - 1] = 0;
+  for (int n = strlen(cut); n > 0 && (int)u8g2.getStrWidth(cut) > avail; n--) cut[n - 1] = 0;
+  oStrR(SCR_W - 3, y, cut);
 }
+
+// Rounded badge: filled when on, outlined when off
+static void drawPill(int yBase, const char* text, bool on) {
+  u8g2.setFont(FONT_MICRO);
+  int w = u8g2.getStrWidth(text) + 6;
+  int x = SCR_W - 2 - w;
+  if (on) {
+    oRBox(x, yBase - 7, w, 9, 2);
+    u8g2.setDrawColor(0);
+    oStr(x + 3, yBase - 1, text);
+    u8g2.setDrawColor(1);
+  } else {
+    oRFrame(x, yBase - 7, w, 9, 2);
+    oStr(x + 3, yBase - 1, text);
+  }
+}
+
+static void drawStateRow(int y, const char* key, bool on, const char* onTxt, const char* offTxt) {
+  u8g2.setFont(FONT_MICRO);
+  oStr(2, y, key);
+  drawPill(y + 1, on ? onTxt : offTxt, on);
+}
+
+// Largest of the big digit fonts that still fits, falling back to the
+// regular bold value font when even the smallest one would overflow.
+static void drawHeroValue(int yBase, int yTopLimit, const char* num, const char* unit) {
+  u8g2.setFont(FONT_LABEL);
+  int uw = (unit && unit[0]) ? u8g2.getStrWidth(unit) + 3 : 0;
+  int avail = SCR_W - 4 - uw;
+
+  const uint8_t* fonts[4] = { u8g2_font_logisoso24_tn, u8g2_font_logisoso20_tn,
+                              u8g2_font_logisoso16_tn, FONT_VALUE };
+  const uint8_t* best = fonts[3];
+  for (int i = 0; i < 4; i++) {
+    u8g2.setFont(fonts[i]);
+    if ((int)u8g2.getStrWidth(num) <= avail &&
+        yBase - u8g2.getAscent() >= yTopLimit) { best = fonts[i]; break; }
+  }
+
+  u8g2.setFont(best);
+  int nw = u8g2.getStrWidth(num);
+  oStr(SCR_W - 2 - uw - nw, yBase, num);
+  if (uw) {
+    u8g2.setFont(FONT_LABEL);
+    oStr(SCR_W - 2 - uw + 3, yBase, unit);
+  }
+}
+
+// Filled area chart over the power history: a dithered body under a
+// solid trace. Columns map 1:1 to history slots, newest on the right.
+static void drawPowerArea(int x0, int yTop, int yBottom, int points, bool grid) {
+  int h = yBottom - yTop;
+  if (h < 2 || points < 2) return;
+
+  float maxP = 1.0f;
+  for (int k = 0; k < GRAPH_POINTS; k++)
+    if (powerHist[k] > maxP) maxP = powerHist[k];
+  maxP = niceCeil(maxP);
+  gGraphMax = maxP;
+
+  if (grid) {
+    for (int g = 1; g <= 3; g++) dashedHLine(x0, x0 + points - 1, yBottom - (h * g) / 4);
+    dashedHLine(x0, x0 + points - 1, yTop);
+  }
+
+  const int first = GRAPH_POINTS - points;        // leftmost history slot shown
+  const int oldest = GRAPH_POINTS - histCount;    // first slot holding real data
+  int prevX = -1, prevY = 0;
+  for (int i = 0; i < points; i++) {
+    int idx = first + i;
+    if (idx < oldest) continue;                   // not sampled yet
+    float v = powerHist[idx];
+    if (isnan(v) || v < 0) v = 0;
+    int y = yBottom - (int)((v / maxP) * h + 0.5f);
+    if (y > yBottom) y = yBottom;
+    if (y < yTop)    y = yTop;
+
+    ditherCol(x0 + i, y, yBottom);                  // body
+    if (prevX >= 0) oLine(prevX, prevY, x0 + i, y); // solid trace on top
+    else            oPixel(x0 + i, y);
+    prevX = x0 + i;
+    prevY = y;
+  }
+
+  oHLine(x0, yBottom + 1, points);                  // baseline
+  if (prevX >= 0) oDisc(prevX - 1, prevY, 1);       // "now" marker
+}
+
+// ---- boot / status screens --------------------------------------
+void splashScreen() {
+  const int cx = SCR_W / 2;
+
+  for (int p = 0; p <= 100; p += 4) {
+    u8g2.clearBuffer();
+
+    // lightning bolt
+    oTri(cx + 4, 20, cx - 6, 42, cx + 1, 42);
+    oTri(cx - 1, 40, cx + 6, 40, cx - 4, 62);
+
+    u8g2.setFont(u8g2_font_7x13B_tr);
+    oStrC(cx, 82, "ENERGY");
+    oStrC(cx, 95, "METER");
+
+    u8g2.setFont(FONT_MICRO);
+    oStrC(cx, 106, "AmirY  V5");
+
+    oRFrame(6, 112, SCR_W - 12, 7, 2);
+    if (p > 2) oBox(8, 114, ((SCR_W - 16) * p) / 100, 3);
+
+    u8g2.sendBuffer();
+    delay(14);
+  }
+  delay(300);
+}
+
+// Shared layout for the boot / OTA messages, with an optional bar
+static void drawBanner(const char* title, const char* msg, int progress) {
+  u8g2.clearBuffer();
+  drawHeader(title);
+
+  u8g2.setFont(FONT_MICRO);
+  size_t len = strlen(msg);
+  if ((int)u8g2.getStrWidth(msg) <= SCR_W - 4 || len >= 24) {
+    oStrC(SCR_W / 2, 52, msg);
+  } else {
+    // split on the space nearest the middle so long messages fit
+    char line[24];
+    size_t cut = len / 2;
+    while (cut > 0 && msg[cut] != ' ') cut--;
+    if (cut == 0) cut = len / 2;
+    strncpy(line, msg, cut);
+    line[cut] = 0;
+    oStrC(SCR_W / 2, 46, line);
+    oStrC(SCR_W / 2, 56, msg + cut + (msg[cut] == ' ' ? 1 : 0));
+  }
+
+  if (progress >= 0) {
+    oRFrame(6, 68, SCR_W - 12, 9, 2);
+    if (progress > 2) oBox(8, 70, ((SCR_W - 16) * progress) / 100, 5);
+    char pct[12];
+    snprintf(pct, sizeof(pct), "%d%%", progress % 1000);
+    u8g2.setFont(FONT_SMALL);
+    oStrC(SCR_W / 2, 92, pct);
+  }
+  u8g2.sendBuffer();
+}
+
+void showWiFiStatus(const char* msg)                   { drawBanner("WIFI", msg, -1); }
+void showOTAStatus(const char* msg, int progress = -1) { drawBanner("OTA",  msg, progress); }
 
 // ---- Screen 1: main readings ----
+// One grid cell: unit lives in the label so the value stays a big number
+static void drawCell(int x, int y, const char* label, const char* val) {
+  u8g2.setFont(FONT_MICRO);
+  oStr(x + 3, y + 6, label);
+  u8g2.setFont(FONT_VALUE);
+  if ((int)u8g2.getStrWidth(val) > 28) u8g2.setFont(FONT_LABEL);
+  oStrR(x + 29, y + 18, val);
+}
+
 void drawMainScreen() {
-  int y = 8;
-  drawParameter(y, "Voltage:", gV,  "V",   0);
-  drawParameter(y, "Current:", gI,  "A",   2);
-  drawParameter(y, "Power:",   gP,  "W",   1);
-  drawParameter(y, "Energy:",  gE,  "kWh", 1);
-  drawParameter(y, "Freq:",    gF,  "Hz",  1);
-  drawParameter(y, "PF:",      gPF, "",    2);
-  drawWiFiIcon();
+  drawHeader("ENERGY");
+
+  u8g2.setFont(FONT_MICRO);
+  oStr(2, 17, "POWER");
+  drawHeroValue(42, 20, fmtF(gP, 0), "W");
+  oHLine(0, 44, SCR_W);
+
+  drawCell(0,  46, "VOLT V",  fmtF(gV, 0));
+  drawCell(32, 46, "CURR A",  fmtF(gI, 2));
+  oVLine(31, 48, 15);
+  oHLine(0, 65, SCR_W);
+
+  drawCell(0,  67, "FREQ Hz", fmtF(gF, 1));
+  drawCell(32, 67, "POW.F",   fmtF(gPF, 2));
+  oVLine(31, 69, 15);
+  oHLine(0, 86, SCR_W);
+
+  drawKV(96, "kWh", fmtF(gE, 2));
+
+  // glanceable sparkline over the same history the graph screen plots
+  drawPowerArea(2, 103, 116, 60, false);
+
+  drawPageDots();
 }
 
 // ---- Screen 2: power graph ----
 void drawGraphScreen() {
-  u8g2.setFont(u8g2_font_6x12_tr);
-  u8g2.setCursor(0, 10);
-  u8g2.print("Power W");
-  u8g2.setFont(u8g2_font_7x13B_tr);
-  u8g2.setCursor(0, 26);
-  u8g2.print(isnan(gP) ? 0 : gP, 0);
+  drawHeader("POWER");
 
-  const int top = 34, bottom = 118;
-  const int h = bottom - top;
+  drawHeroValue(36, 13, fmtF(gP, 0), "W");
+  oHLine(0, 40, SCR_W);
 
-  float maxP = 1.0f;
-  for (int k = 0; k < histCount; k++)
-    if (powerHist[k] > maxP) maxP = powerHist[k];
+  drawPowerArea(0, 50, 102, GRAPH_POINTS, true);
 
-  u8g2.drawHLine(0, bottom, GRAPH_POINTS);
+  // scale row, drawn after the chart so gGraphMax is known
+  char buf[16];
+  u8g2.setFont(FONT_MICRO);
+  oStr(2, 46, "2 min");
+  snprintf(buf, sizeof(buf), "max %s", fmtK(gGraphMax));
+  oStrR(SCR_W - 3, 46, buf);
+
+  // average and peak over the window on screen
+  float sum = 0, peak = 0;
   for (int k = 0; k < histCount; k++) {
-    int   idx = GRAPH_POINTS - histCount + k;
-    float val = powerHist[idx];
-    if (isnan(val) || val < 0) val = 0;
-    int bh = (int)(val / maxP * h);
-    if (bh > 0) u8g2.drawVLine(k, bottom - bh, bh);
+    float v = powerHist[GRAPH_POINTS - 1 - k];
+    if (isnan(v) || v < 0) v = 0;
+    sum += v;
+    if (v > peak) peak = v;
   }
+  float avg = histCount ? sum / histCount : 0;
 
-  u8g2.setFont(u8g2_font_4x6_tr);
-  u8g2.setCursor(0, bottom + 8);
-  u8g2.print("max:");
-  u8g2.print(maxP, 0);
+  drawKV(111, "AVG W",  fmtK(avg));
+  drawKV(119, "PEAK W", fmtK(peak));
+
+  drawPageDots();
 }
 
 // ---- Screen 3: general status ----
@@ -465,75 +716,177 @@ void formatUptime(char* buf, size_t n) {
   snprintf(buf, n, "%luh%02lum%02lus", h, m, sec);
 }
 
-void drawStatusScreen() {
-  u8g2.setFont(u8g2_font_6x12_tr);
-  u8g2.setCursor(0, 10);
-  u8g2.print("STATUS");
-  u8g2.drawHLine(0, 13, GRAPH_POINTS);
+// Two-part form for the LCD, where the full string does not fit
+void formatUptimeShort(char* buf, size_t n) {
+  unsigned long s = millis() / 1000;
+  unsigned long h = s / 3600;
+  if (h) snprintf(buf, n, "%luh%02lum", h, (s % 3600) / 60);
+  else   snprintf(buf, n, "%lum%02lus", s / 60, s % 60);
+}
 
-  u8g2.setFont(u8g2_font_5x8_tr);
-  int y = 26;
+void drawStatusScreen() {
+  drawHeader("STATUS");
+
   bool wl = (WiFi.status() == WL_CONNECTED);
 
-  u8g2.setCursor(0, y);      u8g2.print("WiFi:");
-  u8g2.print(wl ? "OK" : "--"); y += 10;
-  u8g2.setCursor(0, y);      u8g2.print(WiFi.SSID().substring(0, 12)); y += 10;
-  u8g2.setCursor(0, y);      u8g2.print(WiFi.localIP().toString());    y += 10;
-  u8g2.setCursor(0, y);      u8g2.print("RSSI:");
-  u8g2.print(wl ? WiFi.RSSI() : 0); u8g2.print("dBm"); y += 10;
-  u8g2.setCursor(0, y);      u8g2.print("MQTT:");
-  u8g2.print(mqtt.connected() ? "OK" : "--"); y += 10;
+  drawStateRow(21, "WIFI", wl, "LINK", "DOWN");
+  dashedHLine(2, SCR_W - 3, 25);
 
-  char up[24];
-  formatUptime(up, sizeof(up));
-  u8g2.setCursor(0, y);      u8g2.print("Up:"); y += 10;
-  u8g2.setCursor(0, y);      u8g2.print(up);
+  String ssid = wl ? WiFi.SSID() : String("-");
+  drawKV(35, "SSID", ssid.c_str());
+  dashedHLine(2, SCR_W - 3, 39);
+
+  // the IP needs the full width, so it gets a centred line of its own
+  String ip = wl ? WiFi.localIP().toString() : String("not connected");
+  u8g2.setFont(FONT_MICRO);
+  oStrC(SCR_W / 2, 49, ip.c_str());
+  dashedHLine(2, SCR_W - 3, 53);
+
+  // signal strength: value plus a bar
+  int rssi = wl ? WiFi.RSSI() : -100;
+  int q = (rssi + 100) * 2;                       // -100..-50 dBm -> 0..100%
+  if (q < 0)   q = 0;
+  if (q > 100) q = 100;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d dBm", rssi);
+  drawKV(63, "RSSI", buf);
+  oRFrame(2, 66, SCR_W - 5, 7, 2);
+  if (q > 3) oBox(4, 68, ((SCR_W - 9) * q) / 100, 3);
+
+  drawStateRow(85, "MQTT", mqtt.connected(), "CONN", "OFF");
+  dashedHLine(2, SCR_W - 3, 89);
+
+  formatUptimeShort(buf, sizeof(buf));
+  drawKV(99, "UPTIME", buf);
+  dashedHLine(2, SCR_W - 3, 103);
+
+  drawKV(113, "HEAP", fmtK(ESP.getFreeHeap()));
+
+  drawPageDots();
 }
 
 // ---- Screen 4: general info ----
 void drawInfoScreen() {
-  u8g2.setFont(u8g2_font_6x12_tr);
-  u8g2.setCursor(0, 10);
-  u8g2.print("INFO");
-  u8g2.drawHLine(0, 13, GRAPH_POINTS);
+  drawHeader("INFO");
 
-  u8g2.setFont(u8g2_font_5x8_tr);
-  int y = 26;
-  u8g2.setCursor(0, y); u8g2.print("Total kWh:");        y += 10;
-  u8g2.setCursor(0, y); u8g2.print(isnan(gE) ? 0 : gE, 1); y += 12;
-  u8g2.setCursor(0, y); u8g2.print("Max W:");            y += 10;
-  u8g2.setCursor(0, y); u8g2.print(maxPower, 0);         y += 12;
-  u8g2.setCursor(0, y); u8g2.print("Sessions:");
-  u8g2.print(sessionCount);                               y += 10;
-  u8g2.setCursor(0, y);
-  u8g2.print(sessionActive ? "Wash: RUN" : "Wash: idle"); y += 12;
-  u8g2.setCursor(0, y); u8g2.print("Heap:");
-  u8g2.print(ESP.getFreeHeap());
+  u8g2.setFont(FONT_MICRO);
+  oStr(2, 17, "TOTAL");
+  drawHeroValue(42, 20, fmtF(gE, 1), "kWh");
+  oHLine(0, 44, SCR_W);
+
+  drawKV(56, "PEAK W", fmtF(maxPower, 0));
+  dashedHLine(2, SCR_W - 3, 60);
+
+  drawKV(70, "SESSIONS", fmtF(sessionCount, 0));
+  dashedHLine(2, SCR_W - 3, 74);
+
+  drawStateRow(84, "WASH", sessionActive, "RUN", "IDLE");
+  dashedHLine(2, SCR_W - 3, 88);
+
+  drawKV(98, "HEAP", fmtK(ESP.getFreeHeap()));
+  dashedHLine(2, SCR_W - 3, 102);
+
+  drawKV(112, "FIRMWARE", "V5");
+
+  drawPageDots();
 }
 
-void renderScreen() {
-  u8g2.clearBuffer();
-  switch (currentScreen) {
+// ---- renderer + slide transition --------------------------------
+static void renderTo(uint8_t s) {
+  gDrawScreen = s;
+  switch (s) {
     case SCR_MAIN:   drawMainScreen();   break;
     case SCR_GRAPH:  drawGraphScreen();  break;
     case SCR_STATUS: drawStatusScreen(); break;
     case SCR_INFO:   drawInfoScreen();   break;
   }
+}
+
+void renderScreen() {
+  gOX = 0;
+  u8g2.clearBuffer();
+  renderTo(currentScreen);
   u8g2.sendBuffer();
+}
+
+// Slides `next` in from the right (dir = +1) or from the left (dir = -1)
+static void slideToScreen(uint8_t next, int8_t dir) {
+  if (next == currentScreen) { renderScreen(); return; }
+
+  const int steps = 5;
+  for (int i = 1; i <= steps; i++) {
+    int off = (SCR_W * i) / steps;
+    u8g2.clearBuffer();
+    gOX = -off * dir;          renderTo(currentScreen);
+    gOX = (SCR_W - off) * dir; renderTo(next);
+    gOX = 0;
+    u8g2.sendBuffer();
+    yield();
+  }
+  currentScreen = next;
+  gDrawScreen   = next;
+}
+
+// ============================================================
+//  Backlight (PWM on LCD_LED)
+//  Full brightness while someone is at the meter, faded down after
+//  a stretch with no touch. Any touch brings it straight back.
+// ============================================================
+void backlightWake() {
+  blLastActivity = millis();
+  blTarget = LCD_BRIGHTNESS;
+}
+
+void handleBacklight() {
+  unsigned long now = millis();
+
+  if (blTarget != LCD_DIM_LEVEL && now - blLastActivity >= LCD_DIM_TIMEOUT)
+    blTarget = LCD_DIM_LEVEL;
+
+  if (blCurrent != blTarget && now - blLastFade >= LCD_FADE_MS) {
+    blLastFade = now;
+    if (blCurrent < blTarget) {
+      blCurrent += LCD_FADE_STEP;
+      if (blCurrent > blTarget) blCurrent = blTarget;
+    } else {
+      blCurrent -= LCD_FADE_STEP;
+      if (blCurrent < blTarget) blCurrent = blTarget;
+    }
+    analogWrite(LCD_LED, blCurrent);
+  }
 }
 
 // ============================================================
 //  Touch handling
+//    tap        -> next screen (animated)
+//    long press -> back to the main screen
+//  A touch on a dimmed display only wakes it, so the first tap in the
+//  dark never changes the screen out from under you.
 // ============================================================
 void handleTouch() {
   int s = digitalRead(TOUCH_PIN);
-  if (s != lastTouchState && (millis() - lastTouchTime) > TOUCH_DEBOUNCE) {
-    lastTouchTime = millis();
+  unsigned long now = millis();
+
+  if (s != lastTouchState && (now - lastTouchTime) > TOUCH_DEBOUNCE) {
+    lastTouchTime  = now;
     lastTouchState = s;
-    if (s == HIGH) {                       // rising edge = touch
-      currentScreen = (currentScreen + 1) % SCREEN_COUNT;
-      renderScreen();                       // immediate feedback
+
+    if (s == HIGH) {                          // press
+      touchWokeDisplay = (blTarget == LCD_DIM_LEVEL);
+      touchDownTime    = now;
+      longPressFired   = false;
+      backlightWake();
+    } else {                                  // release
+      backlightWake();
+      if (!longPressFired && !touchWokeDisplay)
+        slideToScreen((currentScreen + 1) % SCREEN_COUNT, +1);
     }
+  }
+
+  if (s == HIGH && !longPressFired && (now - touchDownTime) >= TOUCH_LONG_PRESS) {
+    longPressFired = true;
+    backlightWake();
+    if (currentScreen != SCR_MAIN) slideToScreen(SCR_MAIN, -1);
   }
 }
 
@@ -579,18 +932,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String resetTopic = String(config.mqtt_topic) + "/reset";
   if (String(topic) == resetTopic && message == "RESET") {
     Serial.println("Resetting energy counter...");
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_7x13B_tr);
-    u8g2.setCursor(5, 30); u8g2.print("Resetting");
-    u8g2.setCursor(5, 50); u8g2.print("Counter...");
-    u8g2.sendBuffer();
+    backlightWake();
+    drawBanner("RESET", "Resetting counter", -1);
 
     bool ok = pzem.resetEnergy();
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_7x13B_tr);
-    if (ok) { u8g2.setCursor(10, 40); u8g2.print("Reset OK!"); }
-    else    { u8g2.setCursor(5, 40);  u8g2.print("Reset Failed"); }
-    u8g2.sendBuffer();
+    drawBanner("RESET", ok ? "Reset OK" : "Reset failed", -1);
     delay(1500);
 
     mqtt.publish((String(config.mqtt_topic) + "/reset_status").c_str(),
@@ -978,7 +1324,7 @@ void setupOTA() {
   ArduinoOTA.setHostname(config.hostname);
   ArduinoOTA.setPassword(OTA_PASSWORD);
 
-  ArduinoOTA.onStart([]() { showOTAStatus("Starting..."); });
+  ArduinoOTA.onStart([]() { backlightWake(); showOTAStatus("Starting..."); });
   ArduinoOTA.onEnd([]()   { showOTAStatus("Complete!"); delay(1000); });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     showOTAStatus("Uploading...", progress / (total / 100));
@@ -1025,6 +1371,7 @@ void setup() {
   pinMode(LCD_LED, OUTPUT);
   analogWriteRange(1023);
   analogWrite(LCD_LED, LCD_BRIGHTNESS);
+  backlightWake();
 
   splashScreen();
 
@@ -1063,6 +1410,7 @@ void loop() {
   server.handleClient();
   mqtt.loop();
   handleTouch();
+  handleBacklight();
 
   unsigned long now = millis();
 

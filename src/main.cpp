@@ -414,13 +414,18 @@ static void dashedHLine(int x0, int x1, int y) {
   for (int x = x0; x <= x1; x += 3) oPixel(x, y);
 }
 
-// Rounds up to the next "nice" axis value: 1, 2 or 5 times a power of ten
+// Rounds up to the next "nice" axis value. The ladder is deliberately finer
+// than 1/2/5: a 2148 W peak against a 5000 W axis would waste half the plot,
+// so the steps in between keep the trace filling the available height.
 static float niceCeil(float v) {
   if (v <= 0) return 1;
+  static const float steps[] = { 1.0f, 1.2f, 1.5f, 2.0f, 2.5f, 3.0f,
+                                 4.0f, 5.0f, 6.0f, 8.0f, 10.0f };
   float e = powf(10, floorf(log10f(v)));
   float m = v / e;
-  float n = (m <= 1.0f) ? 1.0f : (m <= 2.0f) ? 2.0f : (m <= 5.0f) ? 5.0f : 10.0f;
-  return n * e;
+  for (uint8_t i = 0; i < sizeof(steps) / sizeof(steps[0]); i++)
+    if (m <= steps[i] + 0.0001f) return steps[i] * e;
+  return 10.0f * e;
 }
 
 // ---- shared chrome ----------------------------------------------
@@ -593,7 +598,7 @@ void splashScreen() {
     oStrC(cx, 95, "METER");
 
     u8g2.setFont(FONT_MICRO);
-    oStrC(cx, 106, "AmirY  V5");
+    oStrC(cx, 106, "AmirY  V7");
 
     oRFrame(6, 112, SCR_W - 12, 7, 2);
     if (p > 2) oBox(8, 114, ((SCR_W - 16) * p) / 100, 3);
@@ -786,7 +791,7 @@ void drawInfoScreen() {
   drawKV(98, "HEAP", fmtK(ESP.getFreeHeap()));
   dashedHLine(2, SCR_W - 3, 102);
 
-  drawKV(112, "FIRMWARE", "V5");
+  drawKV(112, "FIRMWARE", "V7");
 
   drawPageDots();
 }

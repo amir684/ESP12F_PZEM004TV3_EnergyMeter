@@ -17,10 +17,10 @@ This smart energy meter combines an ESP8266 (ESP-12F) microcontroller with a PZE
 ### Key Features
 - ⚡ **Real-time AC Monitoring**: Voltage, Current, Power, Energy, Frequency, Power Factor
 - 🌐 **Web Management UI**: Built-in web server with tabbed interface — live Status, Sessions history, and editable WiFi / MQTT settings
-- 👆 **Touch Screen Navigation**: TTP223 capacitive touch cycles 4 LCD screens (Readings → Power Graph → Status → Info)
+- 👆 **Touch Screen Navigation**: TTP223 capacitive touch cycles 4 LCD screens (Readings → Power Graph → Status → Info); hold to return to the first screen
 - 🧺 **Washing-Session Logging**: Automatically detects appliance cycles by power draw and logs start/end/duration/energy/peak to flash
 - 🏠 **Home Assistant Auto-Discovery**: Zero-config device creation, including a "Washing" running sensor and availability (LWT)
-- 📊 **ST7567 LCD Display**: 128x64 graphical display with WiFi signal indicator and on-device power graph
+- 📊 **ST7567 LCD Display**: 128x64 graphical display with WiFi signal indicator, on-device power graph and an auto-dimming backlight
 - 💾 **Persistent Config**: Hostname and MQTT settings stored in LittleFS, editable from the web (no reflash)
 - 🕒 **NTP Real-Time Clock**: Accurate timestamps for logged sessions (auto DST)
 - 📡 **OTA Firmware Updates**: Update firmware wirelessly over WiFi
@@ -309,13 +309,62 @@ mqtt:
 
 ## 🎨 LCD Display
 
-Touch the TTP223 sensor to cycle through four screens:
+The panel is a 128x64 ST7567 mounted in portrait (`U8G2_R3`), giving a 64x128
+canvas. All four screens share one header, one set of type styles and a page
+indicator along the bottom.
 
-1. **Main Readings** — Voltage, Current, Power, Energy, Frequency, Power Factor,
-   with a WiFi signal indicator and an **"MQTT"** connection label
-2. **Power Graph** — live scrolling history of power draw
-3. **Status** — WiFi SSID/IP/RSSI, MQTT state, uptime
-4. **Info** — total kWh, peak power, session count, wash state, free heap
+![All four LCD screens](images/screens-all.png)
+
+> These are renders, not photographs: the firmware's drawing code was replayed
+> on the host against the real u8g2 font data, so they are pixel-accurate to
+> what the panel shows.
+
+### 1. Main readings
+
+![Main screen](images/screen-main.png)
+
+Live power as the headline figure — the font scales itself to the largest size
+that fits, so a three-digit reading is set larger than a four-digit one. Below
+it, voltage, current, frequency and power factor sit in a 2x2 grid, then the
+cumulative kWh, then a sparkline of the last two minutes.
+
+### 2. Power graph
+
+![Graph screen](images/screen-graph.png)
+
+Two minutes of history, one sample per pixel column, newest on the right. The
+filled area sits under a solid trace with a marker on the current sample.
+
+The Y axis rounds up to the next value on a 1/1.2/1.5/2/2.5/3/4/5/6/8 ladder
+rather than a plain 1/2/5 one, which keeps the trace filling the plot instead of
+leaving half of it empty; the chosen ceiling is printed top right. Average and
+peak across the window are shown underneath.
+
+### 3. Status
+
+![Status screen](images/screen-status.png)
+
+Link state, SSID, IP address, signal strength as both a figure and a bar, broker
+state, uptime and free heap.
+
+### 4. Info
+
+![Info screen](images/screen-info.png)
+
+Cumulative energy as the headline figure, plus peak power seen, logged session
+count, whether a wash is running, free heap and firmware version.
+
+### Touch behaviour
+
+| Gesture | Action |
+|---------|--------|
+| Tap | Next screen, with a slide transition |
+| Hold (0.8 s) | Jump straight back to the main screen |
+| Tap while dimmed | Wakes the backlight only, without changing screen |
+
+The backlight fades down to a dim level after 60 seconds without a touch and
+comes straight back on the next one. Adjust via `LCD_DIM_LEVEL` and
+`LCD_DIM_TIMEOUT`.
 
 ## 🔧 OTA Updates
 
